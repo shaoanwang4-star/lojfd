@@ -1,0 +1,41 @@
+rules_version = '2';
+
+// 漫阁 —— Cloud Storage 服务端策略
+// 页面图片的读取权限与作品可见性一致（跨服务查 Firestore），只有作者能写自己作品的图片。
+// 部署：Console → Storage → 规则 → 粘贴本文件 → 发布；或 firebase deploy --only storage
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function comic(cid) { return firestore.get(/databases/(default)/documents/comics/$(cid)).data; }
+
+    function canSee(c) {
+      return c.visibility == 'public'
+          || (signedIn() && (uid() == c.ownerId
+              || (c.visibility == 'friends' && uid() in c.friendUids)));
+    }
+    function isImg() {
+      return request.resource.contentType.matches('image/.*')
+          && request.resource.size < 12 * 1024 * 1024;
+    }
+
+    // 章节页面：正文受版权控制
+    match /comics/{cid}/{allPaths=**} {
+      allow read: if canSee(comic(cid));
+      allow write: if signedIn() && comic(cid).ownerId == uid() && isImg();
+      allow delete: if signedIn() && comic(cid).ownerId == uid();
+    }
+
+    // 封面：路径按作者隔离，公开可读（否则书架无法展示）
+    match /users/{u}/{allPaths=**} {
+      allow read: if true;
+      allow write: if signedIn() && uid() == u && isImg();
+      allow delete: if signedIn() && uid() == u;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

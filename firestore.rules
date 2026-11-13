@@ -1,0 +1,123 @@
+rules_version = '2';
+
+// 漫阁 —— Firestore 服务端策略
+// 版权保护与「三级可见性」在这里强制执行：前端代码拦不住直接调 REST/SDK 的人，只有规则拦得住。
+// 部署：Console → Firestore → 规则 → 粘贴本文件 → 发布；或 firebase deploy --only firestore:rules
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function comic(cid) { return get(/databases/$(database)/documents/comics/$(cid)).data; }
+
+    // 可见性：public 任何人可读（含未登录）；friends 只读 friendUids 快照里的人；private 只读作者本人
+    function canSee(c) {
+      return c.visibility == 'public'
+          || (signedIn() && (uid() == c.ownerId
+              || (c.visibility == 'friends' && uid() in c.friendUids)));
+    }
+
+    // 作品文档的字段约束；old 为 null 表示新建
+    function comicShape(d, old) {
+      return d.ownerId == uid()
+          && d.title is string && d.title.size() > 0 && d.title.size() <= 60
+          && d.authorName is string && d.authorName.size() <= 40
+          && d.summary is string && d.summary.size() <= 600
+          && d.notice is string && d.notice.size() <= 160
+          && d.license is string && d.license.size() <= 40
+          && d.tags is list && d.tags.size() <= 8
+          && d.chapterCount is int && d.chapterCount >= 0
+          && d.visibility in ['public', 'friends', 'private']
+          && (d.visibility != 'friends' || (d.friendUids is list && d.friendUids.size() <= 300))
+          && (old == null || (old.ownerId == d.ownerId
+              && old.ownerHandle == d.ownerHandle
+              && old.createdAtMs == d.createdAtMs));
+    }
+
+    // ---------- 用户档案：handle 注册后冻结，邮箱不入库 ----------
+    // 说明：为支持「按 handle 找人」，任何登录用户可读到他人的 handle/displayName（社交公开资料）；
+    // 想彻底关闭枚举，把 list 改成 false 并改用邀请链接。
+    match /users/{u} {
+      allow get: if signedIn();
+      allow list: if signedIn() && request.query.limit <= 10;
+      allow create: if signedIn() && u == uid()
+          && request.resource.data.uid == u
+          && request.resource.data.handle is string
+          && request.resource.data.handle.size() >= 2
+          && request.resource.data.handle.size() <= 30
+          && request.resource.data.displayName is string
+          && request.resource.data.displayName.size() <= 24
+          && !('email' in request.resource.data);
+      allow update: if signedIn() && u == uid()
+          && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName', 'createdAt', 'createdAtMs']);
+      allow delete: if false;
+    }
+
+    // ---------- 好友关系：一个文档承载「申请 + 好友」两种状态 ----------
+    // members 是不可变的双人集合，所以查询必须带 array-contains 自己，否则整条查询失败。
+    match /friendships/{f} {
+      function mine() { return signedIn() && uid() in resource.data.members; }
+      allow get: if mine();
+      allow list: if signedIn() && uid() in resource.data.members && request.query.limit <= 400;
+      allow create: if signedIn()
+          && request.resource.data.members is list
+          && request.resource.data.members.size() == 2
+          && uid() in request.resource.data.members
+          && request.resource.data.from == uid()
+          && request.resource.data.from != request.resource.data['to']
+          && request.resource.data.status == 'pending'
+          && request.resource.data.note is string
+          && request.resource.data.note.size() <= 60;
+      // 双方都能改状态；成员集合与创建时间不可动，防止把关系搬到别人身上
+      allow update: if mine()
+          && request.resource.data.members == resource.data.members
+          && request.resource.data['to'] != request.resource.data.from
+          && request.resource.data.status in ['pending', 'accepted', 'declined']
+          && request.resource.data.note is string && request.resource.data.note.size() <= 60
+          && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'note', 'from', 'to', 'updatedAtMs']);
+      allow delete: if mine();
+    }
+
+    // ---------- 作品 ----------
+    match /comics/{cid} {
+      allow read: if canSee(resource.data);
+      allow create: if signedIn() && comicShape(request.resource.data, null)
+          && 'createdAtMs' in request.resource.data && 'ownerHandle' in request.resource.data;
+      allow update: if signedIn() && resource.data.ownerId == uid()
+          && comicShape(request.resource.data, resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+             ['title', 'authorName', 'summary', 'tags', 'visibility', 'license',
+              'notice', 'friendUids', 'coverPath', 'chapterCount', 'updatedAt', 'updatedAtMs']);
+      allow delete: if signedIn() && resource.data.ownerId == uid();
+
+      // ---------- 章节：权限继承作品，写只认作者 ----------
+      match /chapters/{ch} {
+        allow read: if canSee(comic(cid));
+        allow create, update: if signedIn() && comic(cid).ownerId == uid()
+            && request.resource.data.num is int && request.resource.data.num >= 1 && request.resource.data.num <= 5000
+            && request.resource.data.title is string && request.resource.data.title.size() <= 40
+            && request.resource.data.pages is list && request.resource.data.pages.size() <= 400;
+        allow delete: if signedIn() && comic(cid).ownerId == uid();
+
+        // ---------- 弹幕：可发不可改，作者可治理 ----------
+        match /danmaku/{d} {
+          allow read: if canSee(comic(cid));
+          allow create: if signedIn()
+              && request.resource.data.uid == uid()
+              && request.resource.data.text is string
+              && request.resource.data.text.size() >= 1 && request.resource.data.text.size() <= 50
+              && request.resource.data.name is string && request.resource.data.name.size() <= 24
+              && request.resource.data.page is int && request.resource.data.page >= 0 && request.resource.data.page < 2000
+              && request.resource.data.at is int && request.resource.data.at >= 0 && request.resource.data.at < 600000
+              && request.resource.data.pos in ['scroll', 'top']
+              && request.resource.data.color matches '^#[0-9a-fA-F]{3,8}$';
+          allow update: if false;
+          allow delete: if signedIn() && (resource.data.uid == uid() || comic(cid).ownerId == uid());
+        }
+      }
+    }
+    // 没有匹配的文档路径默认拒绝（规则只有 allow，没有 deny）
+  }
+}
